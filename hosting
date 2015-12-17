@@ -1,0 +1,2751 @@
+#!/bin/bash
+
+source common.sh
+#source /usr/lib/hosting/common.sh
+
+PROGRAM_VERSION="1.0.6"
+
+CONFIG_FILE="$HOME/.hostingconfig"
+DEFAULT_CACHE_DIR="/var/cache/hosting"
+if ! [ -d $DEFAULT_CACHE_DIR ]; then
+    DEFAULT_CACHE_DIR="/var/tmp/hosting"
+fi
+
+DEFAULT_DB_DIR="/var/db/hosting"
+
+# Common functions
+
+run_subcommand ()
+{
+	local OPTIND
+    while getopts "c:p:" opt; do
+		case $opt in
+			c)
+				local commands=$OPTARG
+				;;
+			p)
+				local parents=$OPTARG
+				;;
+			*)
+				;;
+        esac
+    done
+    shift "$((OPTIND - 1))"
+    
+	local subcommand=$1
+	shift
+	
+	# Choose subcommand
+	case $subcommand in
+		"")
+			usage "$commands"
+			;;
+		*)
+			if [[ " $commands " =~ " $subcommand " ]]; then
+				local scope=$(tr ' ' '_' <<< "$parents")
+				local command_name="sub_${scope:+"${scope}_"}${subcommand}"
+				$command_name "$@"
+			else
+				error_exit "Unknown subcommand '$subcommand'"
+			fi
+			;;
+	esac
+}
+
+get_list ()
+{
+    local list_value=$1
+    
+    if [ "$list_value" = '-' ]; then
+		list=$(cat)
+    elif [ -f "$list_value" ]; then
+		list=$(cat "$list_value")
+    else
+		list=$list_value
+    fi
+    
+    echo $list
+}
+
+filter_opts()
+{
+	local opts=$1
+	local remove=$2
+	shift 2
+
+    # Read options
+    local OPTIND
+    while getopts "$opts" opt; do
+		case $opt in
+			$remove)
+				;;
+			*)
+				echo -n "-$opt "
+				if [ -n "$OPTARG" ]; then
+					printf "%q " "$OPTARG"
+				fi
+				;;
+        esac
+    done
+    shift "$((OPTIND - 1))"
+    
+    local arg
+    for arg; do
+		printf "%q " "$arg"
+    done
+}
+
+is_me ()
+{
+    local cluster=$1
+    
+    if [ "$cluster" = "$CLUSTER" ]; then
+		return 0 # true
+    fi
+
+    return 1 # false
+}
+
+dir_size ()
+{
+	local dir=$1
+	
+	if [ -d "$dir" ]; then
+		du -sh "$dir" | cut -f 1
+	else
+		echo 0
+	fi
+}
+
+get_domain_nss ()
+{
+	local domain=$1
+	dig +short $domain NS | sed 's/\.$//' | sort
+}
+
+get_domain_registrar_nss ()
+{
+	local domain=$1
+	whois $domain | grep -i 'nserver\|name server' | cut -f 2 -d ":" | tr '[:upper:]' '[:lower:]' | tr -d ' ' | sed 's/\.$//' | sed '/^$/d' | sort | uniq
+}
+
+get_domain_parent_nss ()
+{
+	local domain=$1
+	local ns=$(dig +short "${domain#*.}" NS | head -n 1)
+	dig "@$ns" "$domain" NS | grep -v '^;' | grep NS | awk '{print $5}' | tr '[:upper:]' '[:lower:]' | sed 's/\.$//' | sort
+}
+
+memoize ()
+{
+	local indicator_hint
+	
+    # Read options
+    local OPTIND
+    while getopts "h:" opt; do
+		case $opt in
+			h)
+				indicator_hint=$OPTARG
+				;;
+        esac
+    done
+    shift "$((OPTIND - 1))"
+    
+	prepare_cache
+	
+	local cache_file="$CACHE_DIR/$(IFS=''; tr -ds "[:space:]'" "[:punct:]" <<< "$@" | tr -s '/' '_')"
+	
+    if ! [ -f "$cache_file" ]; then
+		local temp_cache_file=$(mktemp)
+		
+		eval "$@" > "$temp_cache_file" &
+		loading_indicator "$!" "$indicator_hint"
+		wait
+		
+		mv "$temp_cache_file" "$cache_file"
+    fi
+    
+    cat "$cache_file"
+}
+
+get_website_engine ()
+ {
+ 	local domain=$1
+
+	local www_domain=$(get_www_domain "$domain") 	
+	curl -ILs "http://$www_domain" | grep "X-Engine" | cut -d ':' -f 2- | trim
+}
+
+get_domain_registrar ()
+{
+	local domain=$1
+	whois $domain | grep -i '^\(registrar:\|Sponsoring Registrar\)' | cut -f 2 -d ":" | tr "[:space:]" ' ' | trim | sed '/^$/d' 
+}
+
+get_www_dir ()                                                                                                                                                                                                                        
+{                                                                                                                                                                                                                                     
+	local domain=$1                                                                                                                                                                                                               
+                                                                                                                                                                                                                              
+	local vhost_file=$(get_apache_vhost_file "$domain")                                                                                                                                                                           
+	local pattern="^[[:space:]]*DocumentRoot[[:space:]]*"                                                                                                                                                                        
+                                                                                                                                                                                                                                      
+	grep "$pattern" "$vhost_file" | head -n 1 | sed "s/$pattern//"                                                                                                                                                                
+} 
+
+get_php_ini_file ()
+{
+	local domain=$1
+	local home=$2
+
+	test -f "$home/etc/php.ini" ||
+		error_exit "Can't locate PHP configuration file for CGI: '$home/etc/php.ini' doesn't exist"
+		
+	readlink -f "$home/etc/php.ini"
+}
+
+get_apache2_php_ini_file ()
+{
+	test -f "$APACHE_PHP_INI" ||
+		error_exit "Can't locate PHP configuration file for mod_apache: '$APACHE_PHP_INI' doesn't exist"
+	
+	readlink -f "$APACHE_PHP_INI"
+}
+
+get_apache_vhost_file ()
+{
+	local domain=$1
+	
+	grep -l "^[[:space:]]*Server\(Name\|Alias\)[[:space:]]\+${domain}[[:space:]]*\$" $APACHE_VHOSTS_PATTERN | head -n 1	
+}
+
+get_www_domain ()
+{
+	local domain=$1
+	
+	local vhost_file=$(get_apache_vhost_file "$domain")
+	if [ -f "$vhost_file" ]; then
+		grep  "^[[:space:]]*ServerName[[:space:]]\+" "$vhost_file" | trim | sed "s/^ServerName[[:space:]]*//"
+	fi
+}
+
+get_user_ini_file ()
+{
+	local domain=$1
+	
+	echo "$(get_www_dir "$domain")/.user.ini"
+}
+
+get_htaccess_file ()
+{
+	local domain=$1
+	
+	echo "$(get_www_dir "$domain")/.htaccess"
+}
+
+add_lines ()
+{
+    # Read options
+    local OPTIND
+    while getopts "p:a:b:r:u:" opt; do
+		case $opt in
+			p)
+				local pattern=$OPTARG
+				;;
+			a)
+				local afterLinePattern=$OPTARG
+				;;
+			b)
+				local beforeLinePattern=$OPTARG
+				;;				
+			r)
+				local replaceLinePattern=$OPTARG
+				;;
+			u)
+				local uniqueLinePattern=$OPTARG
+				;;								
+        esac
+    done
+    shift "$((OPTIND - 1))"
+    
+    local -A temps
+    
+    while read line; do
+		for file; do
+			info "Adding line into '$file': '$line'"
+			if [ -z "${temps[$file]}" ]; then
+				temps[$file]=$(mktemp)
+				
+				if [ -f "$file" ]; then
+					cp "$file" "${temps[$file]}"
+					cp "${temps[$file]}" "${temps[$file]}.copy"
+				else
+					touch "${temps[$file]}" "${temps[$file]}.copy"
+				fi
+			fi
+			
+			gawk "
+				function get_regexp(linePattern, line)
+				{
+					if(${#pattern} && length(linePattern))
+					{
+						replacement = gensub(/\\\\(\\\\[0-9])/, \"\\\\1\", \"g\", linePattern)
+						return gensub(/$pattern/, replacement, \"g\", line)
+					}
+					else
+						return linePattern
+				}
+				
+				BEGIN {
+					getline line < \"-\"
+								
+					afterLineRegexp = get_regexp(\"$(regex_escape <<< "$afterLinePattern" | escape)\", line)
+					beforeLineRegexp = get_regexp(\"$(regex_escape <<< "$beforeLinePattern" | escape)\", line)
+					replaceLineRegexp = get_regexp(\"$(regex_escape <<< "$replaceLinePattern" | escape)\", line)
+					uniqueLineRegexp = get_regexp(\"$(regex_escape <<< "$uniqueLinePattern" | escape)\", line)
+										
+					line_printed = 0
+				}
+				
+				!line_printed && length(afterLineRegexp) && \$0 ~ afterLineRegexp {
+					print AFTER  > \"/dev/stderr\" 
+					print \$0
+					print line
+					line_printed++
+					skip=1
+				}
+				
+				!line_printed && length(beforeLineRegexp) && \$0 ~ beforeLineRegexp { 
+					print line
+					line_printed++
+				}
+				
+				!line_printed && length(replaceLineRegexp) && \$0 ~ replaceLineRegexp {
+					print line
+					line_printed++
+					skip=1
+				}
+				
+				length(uniqueLineRegexp) && \$0 ~ uniqueLineRegexp {
+					if(!line_printed) 
+					{
+						print line
+						line_printed++
+					}
+					skip=1
+				}
+				
+				{
+					if(skip) skip--
+					else print \$0
+				}
+				
+				END {
+					if(!line_printed) 
+						print line
+				}
+				
+			" "${temps[$file]}.copy" <<< "$line" > "${temps[$file]}"
+			cp "${temps[$file]}" "${temps[$file]}.copy"
+		done
+	done
+	
+	for file; do
+		if [ -n "${temps[$file]}" ]; then
+			mv "${temps[$file]}" "$file"
+			rm "${temps[$file]}.copy"
+		fi
+	done
+}
+
+prefix_lines ()
+{
+	local prefix=$1
+	local file=$2
+	
+	while read line; do
+		local line_regexp=$(regex_escape <<< "$line")
+		sed -i.bak "s/^$line_regexp\$/$prefix\0/" "$file"
+	done
+}
+
+add_domain_record ()
+{
+	local domain=$1
+	local record=$2
+
+ 	info "Adding record '$record' to the domain '$domain'"
+	virtualmin modify-dns --domain "$domain" --add-record "$record"
+}
+
+remove_domain_record ()
+{
+	local domain=$1
+	local record=$2
+
+	info "Removing record '$record' from the domain '$domain'"
+	virtualmin modify-dns --domain "$domain" --remove-record "$record"
+}
+
+remove_server_alias ()
+{
+	local als=$1
+	local domain=$2
+
+	# Remove ServerAlias from vhost
+	local vhost_file=$(get_apache_vhost_file "$domain")
+	local als_regexp=$(regex_escape <<< "$als.$domain")
+	sed -i.bak -r "/^[[:space:]]*ServerAlias[[:space:]]+${als_regexp}[[:space:]]*$/d" "$vhost_file"
+	apachectl graceful
+	
+	# Remove CNAME record from domain zone
+	remove_domain_record "$domain" "$als CNAME @"
+}
+
+add_server_alias ()
+{
+	local als=$1
+	local domain=$2
+
+	# Add ServerAlias into vhost
+	local vhost_file=$(get_apache_vhost_file "$domain")
+	add_lines -p '^ServerAlias (\S+)$' -u "^[[:space:]]*ServerAlias[[:space:]]+\1" -a "^[[:space:]]*ServerName[[:space:]]" -b "<.VirtualHost>" "$vhost_file" <<< "ServerAlias $als.$domain"
+	apachectl graceful
+	
+	# Add CNAME record into domain zone
+	add_domain_record "$domain" "$als CNAME @"
+}
+
+add_php_htaccess_lines ()
+{
+	local htaccess=$1
+	local comment_tag=$2
+	
+	add_lines -p '^php_(value|flag) (\S+) (\S+)$' -u "^php_\1\s+\2\s+" -r "^#${comment_tag}php_\1\s+\2\s+" "$htaccess"
+}
+
+add_php_vhost_lines ()
+{
+	local vhost_file=$1
+	local comment_tag=$2
+	
+	add_lines -p '^php_admin_(value|flag) (\S+) (\S+)$' -u "^php_admin_\1\s+\2\s+" -r "^#${comment_tag}php_admin_\1\s+\2\s+" -b "<.VirtualHost>" "$vhost_file"
+}
+
+add_user_ini_lines ()
+{
+	local user_ini=$1
+	local comment_tag=$2
+	
+	add_lines -p '^(\S+) = (\S*)$' -u "^\s*\1\s*=" -r "^;${comment_tag}^\s*\1\s*=" "$user_ini"
+}
+
+add_php_ini_lines ()
+{
+	local php_ini=$1
+	local comment_tag=$2
+	
+	add_lines -p '^(\S+) = (\S*)$' -u "^\s*\1\s*=" -r "^;${comment_tag}^\s*\1\s*=" -a "^;\s*\1\s*=s*\3$" "$php_ini"
+}
+
+convert_apache_to_cgi_settings ()
+{
+	local domain=$1
+	local home=$2
+	
+	local htaccess=$(get_htaccess_file "$domain")
+	local user_ini=$(get_user_ini_file "$domain")
+	
+	local htaccess_tag=$(regex_escape <<< "[=>.user.ini] ")
+	local user_ini_tag=$(regex_escape <<< "[=>.htaccess] ")
+	
+	if [ -f "$htaccess" ]; then
+		local rule_regexp="^\s*php_\(value\|flag\)\s\+\(\S\+\)\s\+\(\S\+\)\s*\$"
+		local rules=$(grep "$rule_regexp" "$htaccess")
+		
+		if [ -n "$rules" ]; then
+			# Copy rules into .user.ini
+			sed "s/$rule_regexp/\2 = \3/" <<< "$rules" | add_user_ini_lines "$user_ini" "$user_ini_tag"
+			
+			# Comment rules in .htaccess
+			prefix_lines "#$htaccess_tag" "$htaccess" <<< "$rules"
+			
+			# Delete old rules in .user.ini
+			sed -i.bak "/^;$user_ini_tag/d" "$user_ini"
+		fi
+	fi
+	
+	local vhost_file=$(get_apache_vhost_file "$domain")
+	local php_ini=$(get_php_ini_file "$domain" "$home")
+
+	local vhost_tag=$(regex_escape <<< "[=>php.ini] ")
+	
+	if [ -f "$vhost_file" ]; then
+		local rule_regexp="^\s*php_admin_\(value\|flag\)\s\+\(\S\+\)\s\+\(\S\+\)\s*\$"
+		local rules=$(grep "$rule_regexp" "$vhost_file")
+		
+		 # Ignore "engine Off" rule, don't exit on null result
+		rules=$(grep -v "^\s*php_admin_\(value\|flag\)\s\+engine\s\+Off\s*\$" <<< "$rules" || true)
+		
+		if [ -n "$rules" ]; then
+			# Copy rules into php.ini
+			sed "s/$rule_regexp/\2 = \3/" <<< "$rules" | add_php_ini_lines "$php_ini"
+			
+			# Comment rules in vhost
+			prefix_lines "#$vhost_tag" "$vhost_file" <<< "$rules"
+		fi
+	fi
+}
+
+convert_cgi_to_apache_settings ()
+{
+	local domain=$1
+	local home=$2
+	
+	local htaccess=$(get_htaccess_file "$domain")
+	local user_ini=$(get_user_ini_file "$domain")
+	
+	local htaccess_tag=$(regex_escape <<< "[=>.user.ini] ")
+	local user_ini_tag=$(regex_escape <<< "[=>.htaccess] ")
+	
+	if [ -f "$user_ini" ]; then
+		local rule_regexp="^\(\S\+\)\s*=\s*\(\S\+\)\s*\$"
+		local rules=$(grep "$rule_regexp" "$user_ini")
+		
+		if [ -n "$rules" ]; then
+			local flag_regexp="^\(\S\+\)\s*=\s*\(On\|Off\|\"On\"\|\"Off\"\)\s*$"			
+		
+			# Copy flags into .htaccess
+			grep "$flag_regexp"  <<< "$rules" | 
+				sed "s/$rule_regexp/php_flag \1 \2/" | add_php_htaccess_lines "$htaccess" "$htaccess_tag"
+			
+			# Copy other rules into .htaccess
+			grep -v "$flag_regexp" <<< "$rules" | 
+				sed "s/$rule_regexp/php_value \1 \2/" | add_php_htaccess_lines "$htaccess" "$htaccess_tag"
+			
+			# Comment rules in .user.ini
+			prefix_lines ";$user_ini_tag" "$user_ini" <<< "$rules"
+		fi
+		
+		# Delete old rules in .htaccess
+		sed -i.bak "/^#$htaccess_tag/d" "$htaccess"
+	fi
+	
+	local vhost_file=$(get_apache_vhost_file "$domain")
+	local php_ini=$(get_php_ini_file "$domain" "$home")
+	local apache_php_ini=$(get_apache2_php_ini_file)
+
+	local vhost_tag=$(regex_escape <<< "[=>php.ini] ")
+	
+	if [ -f "$php_ini" ]; then
+		
+		local rule_regexp="^\(\S\+\)\s*=\s*\(\S\+\)\s*\$"
+		local rules=$(diff -u "$apache_php_ini" "$php_ini" | grep "^\+" | cut -c 2- | grep "$rule_regexp")
+		
+		if [ -n "$rules" ]; then
+			local flag_regexp="^\(\S\+\)\s*=\s*\(On\|Off\|\"On\"\|\"Off\"\)\s*$"			
+		
+			# Copy flags into vhost
+			grep "$flag_regexp" <<< "$rules" | 
+				sed "s/$rule_regexp/php_admin_flag \1 \2/" | add_php_vhost_lines "$vhost_file" "$vhost_tag"
+			
+			# Copy other rules into vhost
+			grep -v "$flag_regexp"  <<< "$rules" | 
+				sed "s/$rule_regexp/php_admin_value \1 \2/" | add_php_vhost_lines "$vhost_file" "$vhost_tag"
+		fi
+				
+		# Delete old rules in vhost
+		sed -i.bak "/^#$vhost_tag/d" "$vhost_file"
+	fi
+}
+
+get_php_mode ()
+{
+	local domain=$1
+	
+	local vhost_file=$(get_apache_vhost_file "$domain")
+	
+	if [ -f "$vhost_file" ]; then
+		if grep -q "^[[:space:]]*FCGIWrapper[[:space:]]" "$vhost_file"; then
+			echo "fcgid"
+		else
+			echo "mod_php"
+		fi
+	fi
+}
+
+add_global_php_option ()
+{
+	local option=$1
+	local domain=$2
+	
+	case $(get_php_mode "$domain") in
+		mod_php)
+			local vhost_file=$(get_apache_vhost_file "$domain")
+			add_php_vhost_lines  "$vhost_file" <<< "php_admin_value ${option%%=*} ${option#*=}" 
+			;;
+		fcgid|cgi)
+			error_exit "Not implemented yet"
+			add_php_ini_lines "$user_ini"  <<< "${option%%=*} = ${option#*=}" 
+			;;
+	esac
+}
+
+remove_global_php_option ()
+{
+	local option=$1
+	local domain=$2
+}
+
+add_php_option ()
+{
+	local option=$1
+	local domain=$2
+	
+	case $(get_php_mode "$domain") in
+		mod_php)
+			local htaccess=$(get_htaccess_file "$domain")
+			add_php_htaccess_lines "$htaccess" <<< "php_value ${option%%=*} ${option#*=}" 
+			;;
+		fcgid|cgi)
+			local user_ini=$(get_user_ini_file "$domain")
+			add_user_ini_lines "$user_ini"  <<< "${option%%=*} = ${option#*=}" 
+			;;
+	esac	
+}
+
+remove_php_option ()
+{
+	local option=$1
+	local domain=$2
+	
+	case $(get_php_mode "$domain") in
+		mod_php)
+			local htaccess=$(get_htaccess_file "$domain")
+			#add_php_htaccess_lines "$htaccess" <<< "php_value ${option%%=*} ${option#*=}" 
+			;;
+		fcgid|cgi)
+			local user_ini=$(get_user_ini_file "$domain")
+			#add_user_ini_lines "$user_ini"  <<< "${option%%=*} = ${option#*=}" 
+			;;
+	esac	
+}
+
+prepare_cache ()
+{
+	mkdir -p "$CACHE_DIR"
+	
+	find "$CACHE_DIR" -type f -mmin "+${CACHE_TTL}" -delete
+}
+
+clear_cache ()
+{
+	if [ -n "$CACHE_DIR" -a -n "$(ls "$CACHE_DIR")" ]; then
+		rm $CACHE_DIR/*
+	fi
+}
+
+prepare_db()
+{
+	mkdir -p "$DB_DIR"
+	mkdir -p "$DB_DIR/clusters.d"
+}
+
+list_clusters ()
+{
+	if [ -d "$DB_DIR/clusters.d" ]; then
+		ls "$DB_DIR/clusters.d"	
+	else
+		error_exit "There are no clusters registered. Please register this cluster first."
+	fi
+}
+
+get_cluster_file ()
+{
+	local cluster=$1
+	
+	prepare_db
+	
+	echo "$DB_DIR/clusters.d/$cluster"
+}
+
+get_cluster_address ()
+{
+	local cluster=${1:-$CLUSTER}
+	
+	local cluster_file=$(get_cluster_file "$cluster")
+	local address_line=$(grep '^address=.\+$' "$cluster_file")
+	
+	if [ "$address_line" ]; then
+		echo ${address_line#*=}
+	else
+		echo $cluster
+	fi
+}
+
+is_ip() 
+{
+	local string=$1
+	
+	[[ $string =~ ^[12]?[0-9]?[0-9](\.[12]?[0-9]?[0-9]){3}$ ]]
+	
+	return $?
+}
+
+get_host_ip ()
+{
+	local host=$1
+	
+	echo $(dig +short @$TRUSTED_EXT_DNS "$host" A | grep '^[12]\?[0-9]\?[0-9]\(\.[12]\?[0-9]\?[0-9]\)\{3\}$' | head -n 1)
+}
+
+get_cluster_ip_address ()
+{
+	local cluster=${1:-$CLUSTER}
+	
+	local address=$(get_cluster_address "$cluster")
+	local host=${address%%:*}
+		
+	if is_ip "$host"; then
+		echo $host
+	else
+		echo $(get_host_ip "$host")
+	fi
+}
+
+cluster_registered ()
+{
+	local cluster=$1
+	
+	local cluster_file=$(get_cluster_file "$cluster")
+	
+	test -f "$cluster_file"
+	
+	return $?
+}
+
+cluster_command ()
+{
+	local address
+
+    # Read options
+    local OPTIND
+    while getopts "c:a:" opt; do
+		case $opt in
+			c)
+				local cluster=$OPTARG
+				;;
+			a)
+				local address=$OPTARG
+				;;				
+        esac
+    done
+    shift "$((OPTIND - 1))"
+    
+	local command="$1"
+	
+	address=${address:-$(get_cluster_address "$cluster")}
+
+	local host=$address
+	
+	if [[ "$address" =~ : ]]; then
+		local host=${address%%:*}
+		local port=${address#*:}
+	fi
+	
+	if [ -z "$(ssh-keygen -F $host 2> /dev/null)" ]; then
+		ssh-keyscan ${port:+"-p $port"} -H $host >> ~/.ssh/known_hosts 2> /dev/null
+	fi
+	
+	ssh ${port:+"-p $port"} "$host" "$command"
+		
+	return $?
+}
+
+clusters_task ()
+{
+	mktemp
+}
+
+clusters_command ()
+{
+    # Read options
+    local OPTIND
+    while getopts "s" opt; do
+		case $opt in
+			s)
+				local local_also="yes"
+				;;
+        esac
+    done
+    shift "$((OPTIND - 1))"
+    
+	local command="$1"
+	local task_file=$2
+
+	local cluster
+	for cluster in $(list_clusters); do
+		if ! is_me "$cluster"; then
+			local out_file=$(mktemp)
+			cluster_command -c "$cluster" "$command" > $out_file &
+			echo "$cluster $out_file" >> $task_file
+		elif [ "$local_also" = "yes" ]; then
+			local out_file=$(mktemp)
+			$command > $out_file &
+			echo "local $out_file"  >> $task_file
+		fi
+	done
+	
+	wait
+}
+
+clusters_output ()
+{
+    # Read options
+    local OPTIND
+    while getopts "n" opt; do
+		case $opt in
+			n)
+				local names="yes"
+				;;
+        esac
+    done
+    shift "$((OPTIND - 1))"
+
+	local task_file=$1
+	
+	while read line; do
+		local cluster="${line%% *}"
+		local output_file="${line#* }"
+		
+		if [ "$names" = "yes" ]; then
+			echo "$(color_text "$cluster: " "$COLOR_BLUE" "$STYLE_BOLD")"
+		fi
+		cat "$output_file"
+		rm "$output_file"
+	done < $task_file
+	
+	rm "$task_file"
+}
+
+get_subservers ()
+{
+	local domain=$1
+	
+	sub_list -o -f "parent~^$domain\$" 
+}
+
+get_subs ()
+{
+	local domain=$1
+	
+	sub_list -o -f "parent~^$domain\$"
+	sub_list -o -f "alias-origin~^$domain\$" 
+}
+
+declare virtualmin_common_list_opts="oC:c:f:F:D:"
+
+virtualmin_common_list ()
+{
+	local subcommand=$1
+	local scope=$2
+	local itemName=$3
+	local itemsKey=$4
+	local -a list_opts=($5)
+	shift 5
+	
+	local -n available_columns="${scope}_available_columns"
+	local -n column_shortnames="${scope}_column_shortnames"
+	local -n columns_params="${scope}_columns_params"
+	
+	local valueFunction="${scope}_get_column_value"
+	
+	local -a columns=("$itemName")
+	local -A column_filters
+	
+	local -a items
+	
+	local header
+	
+    # Read options
+    local OPTIND
+    local opts="${itemsKey}:${virtualmin_common_list_opts}"
+    while getopts $opts opt; do
+		case $opt in
+			$itemsKey)
+				items=($(get_list "$OPTARG"))
+				;;
+			o)
+				local local="yes"
+				;;
+			C)
+				local char
+				while read -n1 char; do
+					case $char in
+						0)
+							columns=()
+							;;
+						*)
+							test -n "${column_shortnames[$char]}" ||
+								error_exit "Unknown column shortname: '$char'."
+								
+							columns+=("${column_shortnames[$char]}")
+							;;
+					esac
+				done < <(echo -n "$OPTARG")
+				;;
+
+			c)
+				local column
+				for column in $OPTARG; do
+					test -n "${available_columns[$column]}" ||
+						error_exit "Unknown column: '$column'."
+
+					columns+=("$column")
+				done
+				;;
+			f)
+				local filter
+				for filter in $OPTARG; do
+					local column=${filter%%~*}
+					local value=${filter#*~}
+
+					test -n "${available_columns[$column]}" ||
+						error_exit "Unknown column: '$column'."
+					
+					column_filters[$column]+="$value "
+				done
+				;;
+			F)
+				local filter
+				for filter in $OPTARG; do
+					local shortname=${filter:0:1}
+					local value=${filter:1}
+
+					local column=${column_shortnames[$shortname]}
+
+					test -n "$column" ||
+						error_exit "Unknown column shortname '$shortname'."
+
+					column_filters[$column]+="$value "
+				done
+				;;			
+			D)
+				local delimeter=$OPTARG
+				;;
+        esac
+    done
+    
+    if ! [ "$local" = "yes" ]; then
+		local task_file=$(clusters_task)
+ 		clusters_command "hosting $subcommand -o ${items:+"-$itemsKey '${items[*]}'"} -D '${delimeter:-|}' $(filter_opts "$opts" "[${itemsKey}D]" "$@")" "$task_file" &
+	fi
+		
+	local combined=(${!column_filters[@]} ${columns[@]})
+	local -a used_columns=($(IFS=$'\n'; sort -u <<< "${combined[*]}"))
+	
+	if [ "${used_columns[*]}" = "$itemName" ]; then
+		list_opts+=("--name-only")
+	elif [ "$scope" = "domains" ]; then
+		list_opts+=("--simple-multiline")
+	else
+		list_opts+=("--multiline")
+	fi
+	
+	if [ "${#columns[*]}" = 1 ]; then
+		header="${header:-hide}"
+	fi
+	
+	if [ -n "$delimeter" ]; then
+		header="${header:-hide}"
+	fi
+	
+	header="${header:-display}"
+
+	local -a param_regex_parts	
+	for column in ${used_columns[*]}; do
+		if [ -n "${columns_params[$column]}" ]; then
+			param_regex_parts+=("${columns_params[$column]}")
+		fi
+	done
+	local param_regex="^($(IFS='|'; echo "${param_regex_parts[*]}")):"
+	
+	local item
+	local -a found_items
+	local -A values
+	
+	while read line; do
+		if [ -n "$item" ] && [[ $line =~ $param_regex ]]; then
+			local param=${line%%:*}
+			local value=$(trim <<< "${line#*:}")
+			values["$item:$param"]=$value
+		elif ! [[ $line =~ : ]]; then
+			if [ -z "$items" ] || [[ " ${items[@]} " =~ " $line " ]]; then
+				item=$line
+				found_items+=($item)
+			else
+				item=""
+			fi
+		fi                                                                                                                                                                   
+	done <<< "$(memoize -h "Quering Virtualmin" virtualmin "list-$scope" ${list_opts[*]} 2>&-)"
+	
+	local -A column_widths
+	local -a lines
+	if [ "$header" = "display" ]; then
+		# Print header
+		local header_line=''
+		for column in "${columns[@]}"; do
+#			local column_caption=$(color_text "$column" $COLOR_WHITE $STYLE_BOLD)
+			local column_caption="${available_columns[$column]}"
+			column_widths[$column]=${#column_caption}
+			header_line+="$column_caption${delimeter:-|}"
+		done
+		lines+=("$header_line")
+	fi
+	
+	# Print rows                 
+	for item in $(IFS=$'\n'; sort <<< "${found_items[*]}"); do    
+		local -A row_values
+		
+		# Calculate values
+		for column in "${used_columns[@]}"; do
+			local value
+			
+			# Get column value
+			if [ "$column" = "$itemName" ]; then
+				value=$item
+			else
+				local param="${columns_params[$column]}"
+				local param_value="${values["$item:$param"]}"
+				local value="$($valueFunction "$item" "$column" "$param_value")"
+				
+				if [ -z "$value" ]; then
+					if [ -n "$param" ]; then
+						value="$param_value"
+					else
+						value="-"
+					fi
+				fi
+			fi
+
+			# Process filters
+			if [ -n "${column_filters[$column]}" ]; then
+				for filter in ${column_filters[$column]}; do
+					shopt -s nocasematch
+
+					if [ "${filter:0:1}" = "!" ]; then
+						if [[ $value =~ ${filter:1} ]]; then
+							continue 3
+						fi
+					elif ! [[ $value =~ $filter ]]; then
+						continue 3
+					fi
+					
+					shopt -u nocasematch
+				done
+			fi
+				
+ 			row_values[$column]=$value
+		done
+		
+		# Make table line
+		local row=''
+		for column in "${columns[@]}"; do
+			local value=${row_values[$column]}
+			
+			if [ -z "$delimeter" ]; then
+				if (( column_widths[$column] < ${#value} )); then
+					column_widths[$column]=${#value}
+				fi
+			fi
+			
+			row+="$value${delimeter:-|}"
+		done
+		
+		lines+=("$row")
+	done
+	
+	if ! [ "$local" = "yes" ]; then
+		wait
+		while read line; do
+			if [ -z "$delimeter" ]; then
+				local rest=$line
+				for column in "${columns[@]}"; do
+					local value="${rest%%|*}"
+					rest="${rest#*|}"
+					
+					if (( column_widths[$column] < ${#value} )); then
+						column_widths[$column]=${#value}
+					fi
+				done
+			fi
+		
+			lines+=("$line")
+		done <<< "$(clusters_output $task_file)"
+	fi
+	
+	if (( "${#lines}" > "0" )); then
+		if [ -z "$delimeter" ]; then
+			local -a formats
+			local -a fields
+			
+			local field=0
+			for column in "${columns[@]}"; do                                                                                                                                     
+				formats+=("%-${column_widths[$column]}s")
+				fields+=("\$$((++field))")
+			done
+			echo "$(IFS=$'\n'; cat <<< "${lines[*]}")" |
+				gawk -F '|' "{ printf \"${formats[*]}\n\", $(IFS=', '; echo "${fields[*]}")}"
+		else
+			echo "$(IFS=$'\n'; cat <<< "${lines[*]}")"
+		fi
+	fi
+}
+
+common_mass_operation()
+{
+	local scope=$1
+	local itemsKey=$2
+	local list_command=$3
+	shift 3
+	
+	local operation_name
+	local extra_columns
+	local extra_opts
+	local extra_list_opts
+	local null_selection
+	local clear_cache
+
+   # Read options
+    local OPTIND
+    local opts="C:e:l:n:Nc"
+    while getopts "$opts" opt; do
+		case $opt in
+			C)
+				extra_columns=$OPTARG
+				;;		
+			e)
+				extra_opts=$OPTARG
+				;;
+			l)
+				extra_list_opts=$OPTARG
+				;;
+			n)
+				operation_name=$OPTARG
+				;;
+			N)
+				null_selection="allow"
+				;;
+			c)
+				clear_cache="yes"
+				;;
+        esac
+    done
+    shift "$((OPTIND - 1))"
+    unset OPTIND
+
+    
+	local operation_function=$1
+	shift
+	
+	local operation_name=${operation_name:-$operation_function}
+	
+	local -a operation_args
+	local -a list_args
+	local -a list_filters
+	local -a list_short_filters
+	local items
+	local local
+	local all
+
+    # Read options
+    local OPTIND
+    local opts="${itemsKey}:oal:L:$extra_opts$extra_list_opts"
+    while getopts "$opts" opt; do
+		case $opt in
+			$itemsKey)
+				items="$(get_list "$OPTARG")"
+				;;
+			o)
+				local="yes"
+				;;
+			a)
+				all="yes"
+				;;
+			l)
+				list_filters+=("$OPTARG")
+				;;
+			L)
+				list_short_filters+=("$OPTARG")
+				;;
+			*)
+				if [[ "$extra_list_opts" =~ $opt ]]; then
+					list_args+=("-$opt")
+					if [[ "$extra_list_opts" =~ $opt: ]]; then
+						list_args+=("$OPTARG")
+					fi
+				else
+					operation_args+=("-$opt")
+					if [[ "$extra_opts" =~ $opt: ]]; then
+						operation_args+=("$OPTARG")
+					fi
+				fi
+				;;
+        esac
+    done
+    shift "$((OPTIND - 1))"
+    
+    if [ "$null_selection" != "allow" ] && [ -z "$items" ] && [ -z "$all" ]; then
+		error_exit "Please specify $scope with '-$itemsKey', '-a' to process all $scope."
+    fi
+    
+    if [ "$local" != "yes" ]; then
+		local task_file=$(clusters_task)
+ 		clusters_command "hosting $operation_name -o ${items:+"-$itemsKey '$items'"} ${all:+"-a"} ${list_filters:+"-l '${list_filters[*]}'"} ${list_short_filters:+"-L '${list_short_filters[*]}'"} $(quoted_args "${operation_args[@]}")" $task_file &
+	fi   
+	
+	list_args+=(
+		-o
+		${extra_columns:+-C "$extra_columns"} 
+		${list_filters:+-f "${list_filters[*]}"} 
+		${list_short_filters:+-F "${list_short_filters[*]}"} 
+		-D '|'
+	)
+	
+	local list
+	if [ -n "$items" ]; then
+		local list=$($list_command "${list_args[@]}" -$itemsKey- <<< "$items")
+	elif [ "$all" = "yes" ]; then 
+		local list=$($list_command "${list_args[@]}")
+	elif [ "$null_selection" = "allow" ]; then
+		null_selection="yes"
+	fi 
+    
+    local row
+    local -a args
+    if [ -n "$list" ]; then
+		while read row; do
+			IFS='|' read -a args <<< "$row"
+			$operation_function "${operation_args[@]}" "${args[@]}" "$@" < /dev/null
+		done <<< "$list"
+		
+		if [ "$clear_cache" = "yes" ]; then
+			clear_cache
+		fi
+	elif [ "$null_selection" = "yes" ]; then
+		$operation_function "${operation_args[@]}" -0 "$@"
+	fi
+		
+	if [ "$local" != "yes" ]; then
+		wait
+		clusters_output $task_file
+ 	fi
+ }
+
+domains_operation()
+{
+   common_mass_operation "domains" "d" "sub_list" "$@" 
+}
+
+users_operation()
+{
+   common_mass_operation "users" "u" "sub_user_list" "$@" 
+}
+
+# Help subcommand
+
+help_help ()
+{
+	echo "Display help information about subcommands."
+}
+
+usage_help ()
+{
+	echo "hosting help [<subcommand>]"
+}
+
+sub_help ()
+{
+	local subcommand=$1
+	if [ ! "$subcommand" = "" ]; then
+		echo -n "usage: "
+		usage_$subcommand
+		echo
+		help_$subcommand
+	fi
+}
+
+# Version subcommand
+
+help_version ()
+{
+	echo "Display program version."
+}
+
+usage_help ()
+{
+	echo "hosting version"
+}
+
+sub_version ()
+{
+	echo "hosting version $PROGRAM_VERSION"
+}
+
+# Status subcommand
+
+help_status ()
+{
+        echo "Display status information."
+}
+
+usage_status ()
+{
+        echo "hosting status [-l]"
+}
+
+sub_status ()
+{
+    # Read options
+    local OPTIND
+    while getopts "o" opt; do
+		case $opt in
+			o)
+				local local="yes"
+				;;
+        esac
+    done
+
+    if ! [ "$local" = "yes" ]; then
+		local task_file=$(clusters_task)
+		clusters_command "hosting status -o $(quoted_args "$@")" $task_file &
+	fi
+
+	local enabled_count=$(sub_list -o -s enabled | wc -l | tr -d ' ')
+	local disabled_count=$(sub_list -o -s disabled | wc -l | tr -d ' ')
+	
+	echo "$CLUSTER ($enabled_count enabled domains, $disabled_count disabled) "
+	
+	if ! [ "$local" = "yes" ]; then
+		wait
+		clusters_output $task_file
+	fi
+}
+
+# Cluster subcommand
+
+help_cluster ()
+{
+	echo "Manage clusters."
+}
+
+usage_cluster ()
+{
+	echo "hosting cluster [-o] [-c] [-l] [-a] [-r <clusters_to_register> [-u]] [-d <clusters_to_deregister> [-u]] [-x <command> [-n] [-s]]"
+}
+
+sub_cluster ()
+{
+	local local
+	local print_name
+	local print_address
+	local list
+	local register
+	local deregister
+	local unidirectional
+	local command
+	
+	local -a clusters_output_opts
+	local -a clusters_command_opts
+	
+    # Read options
+    local OPTIND
+    while getopts "ocalr:d:ux:ns" opt; do
+		case $opt in
+			o)
+				local="yes"
+				;;			
+			c)
+				print_name="yes"
+				;;
+			a)
+				print_address="yes"
+				;;				
+			l)
+				list="yes"
+				;;
+			r)
+				register=$(get_list "$OPTARG")
+				;;
+			d)
+				deregister=$(get_list "$OPTARG")
+				;;
+			u)
+				unidirectional="yes"
+				;;
+			x)
+				command=$OPTARG
+				;;				
+			n)
+				clusters_output_opts+=("-n")
+				;;
+			s)
+				clusters_command_opts+=("-s")
+				;;
+        esac
+    done
+
+	prepare_db
+
+	if [ "$print_name" = "yes" ]; then
+		echo $CLUSTER
+	fi	
+
+	if [ "$print_address" = "yes" ]; then
+		get_cluster_address
+	fi	
+	
+	local address
+	for address in $register; do
+		info "Connecting to address '$address'..."
+		
+		# Try to connect
+		local key="CONNECTED"
+		local command_output=$(cluster_command -a "$address" "echo '$key'")
+		if [ "$command_output" != "$key" ]; then
+			error_exit "Unable to connect to address '$address'. Please check that SSH port is open and key-based authentication is on."
+		fi
+		
+		# Ask for the cluster's name
+		local cluster=$(cluster_command -a "$address" "hosting cluster -c")
+		if [ -z "$cluster" ]; then
+			error_exit "Unable to retrieve the cluster's name from '$address'. Please check that cluster has 'hosting' command installed."
+		fi
+
+		if cluster_registered "$cluster"; then
+			error_exit "Unable to register cluster '$cluster' on $CLUSTER: cluster with the same name is already registered."
+		fi
+		
+		# Register it on other clusters
+		if [ "$local" != "yes" ]; then
+			local task_file=$(clusters_task)
+			clusters_command "hosting cluster -o -r '$address'" $task_file
+			clusters_output $task_file
+		fi	
+
+		# Add cluster to the list
+		info "Registering cluster '$cluster' on '$CLUSTER'..."		
+		echo "address=$address" > "$(get_cluster_file "$cluster")"
+
+		# Register self
+		if [ "$unidirectional" != "yes" -a "$cluster" != "$CLUSTER" ]; then
+			local self_address=$(get_cluster_address)
+			cluster_command -c "$cluster" "hosting cluster -o -r '$self_address' -u"
+		fi
+	done
+	
+	local cluster
+	for cluster in $deregister; do
+		info "Deregistering cluster '$cluster' on $CLUSTER..."
+		
+		local cluster_file=$(get_cluster_file "$cluster")
+		
+		if ! [ -f "$cluster_file" ]; then
+			error_exit "Unable to deregister cluster '$cluster' on $CLUSTER: cluster with the specified name is not registered."
+		fi
+		
+		#local address=$(get_cluster_address "$cluster")
+		
+		# Unregister self
+		if [ "$unidirectional" != "yes" -a "$cluster" != "$CLUSTER"  ]; then
+			cluster_command -c "$cluster" "hosting cluster -o -d '$CLUSTER' -u"
+		fi
+		
+		# Remove cluster from the list
+		rm "$cluster_file"
+
+		# Deregister it on other clusters
+		if [ "$local" != "yes" ]; then
+			local task_file=$(clusters_task)
+			clusters_command "hosting cluster -o -d '$cluster'" $task_file
+			clusters_output $task_file
+		fi  		
+	done
+	
+	if [ -n "$command" ]; then
+		local task_file=$(clusters_task)
+		clusters_command ${clusters_command_opts[@]} "$command" $task_file
+		clusters_output ${clusters_output_opts[@]} $task_file
+	fi
+	
+	if [ "$list" = "yes" ]; then
+		local cluster
+		for cluster in $(list_clusters); do
+			echo $cluster
+		done
+	fi
+}
+
+# Cache subcommand
+
+help_cache ()
+{
+	echo "Manage cache."
+}
+
+usage_cache ()
+{
+	echo "hosting cache [-c] [-l]"
+}
+
+sub_cache ()
+{
+	local clear
+	local list
+
+    # Read options
+    local OPTIND
+    while getopts "cl" opt; do
+		case $opt in
+			c)
+				clear="yes"
+				;;
+			l)
+				list="yes"
+				;;
+        esac
+    done
+
+	prepare_cache
+
+	if [ "$clear" = "yes" ]; then
+		clear_cache
+	fi
+	
+	if [ "$list" = "yes" ]; then
+		find "$CACHE_DIR" -type f -print
+	fi
+}
+
+# List subcommand
+
+declare -A domains_available_columns=(
+	["cluster"]="Cluster"		
+	["description"]="Description"
+	["dis-time"]="Disabling time"
+	["dis-reason"]="Disabling reason"
+	["domain"]="Domain"
+	["engine"]="Engine"
+	["features"]="Features"
+	["group"]="Group"
+	["home"]="Home"
+	["home-size"]="Home size"
+	["tmp-size"]="Tmp size"
+	["bak-size"]="Bak size"
+	["idn"]="IDN"
+	["level"]="Level"
+	["mail"]="Mail"
+	["ns"]="Nameservers"
+	["ns-reg"]="Nameservers (registrar records)"
+	["ns-parent"]="Nameservers (parent domain records)"
+	["owner"]="Owner"
+	["parent"]="Parent"
+	["alias-origin"]="Alias origin"
+	["plan"]="Plan"
+	["registrar"]="Registrar"
+	["status"]="Status"
+	["subs"]="Sub-servers"
+	["subs-count"]="Sub-servers count"
+	["template"]="Template"
+	["type"]="Type"
+	["users-count"]="Users count"
+	["vhost"]="Virtual host"
+)	
+
+declare -A domains_column_shortnames=(
+	["D"]="description"
+	["e"]="engine"
+	["F"]="features"
+	["G"]="group"
+	["H"]="home"
+	["M"]="mail"
+	["N"]="idn"
+	["O"]="owner"
+	["P"]="plan"
+	["T"]="type"
+	["c"]="cluster"
+	["d"]="domain"
+	["l"]="level"
+	["n"]="ns"
+	["r"]="registrar"
+	["s"]="status"		
+	["p"]="parent"
+)	
+			
+declare -A domains_columns_params=(
+	["description"]="Description"
+	["dis-time"]="Disabled at"
+	["dis-reason"]="Disabled"
+	["features"]="Features"
+	["group"]="Group name"
+	["home"]="Home directory"
+	["home-size"]="Home directory"
+	["tmp-size"]="Home directory"
+	["bak-size"]="Home directory"
+	["idn"]="International domain name"
+	["mail"]="Contact email"
+	["owner"]="Username"
+	["parent"]="Parent domain"
+	["alias-origin"]="Real domain"
+	["plan"]="Plan"
+	["status"]="Disabled"
+	["template"]="Template"
+	["type"]="Type"
+)
+
+domains_get_column_value ()
+{
+	local domain=$1
+	local column=$2	
+	local param_value=$3
+
+	case $column in
+		status)
+			if [ -n "$param_value" ]; then
+				echo "disabled"
+			else
+				echo "enabled"
+			fi
+			;;
+		home-size)
+			local home="$param_value"
+			if [ -n "$home" ]; then
+				memoize -h "$domain: calculating home size" dir_size "$home"
+			else
+				echo "-"
+			fi
+			;;
+		tmp-size)
+			local home="$param_value"
+			if [ -n "$home" -a -d "$home/tmp" ]; then
+				memoize -h "$domain: calculating tmp size" dir_size "$home/tmp"
+			else
+				echo "-"
+			fi
+			;;
+		bak-size)
+			local home="$param_value"
+			if [ -n "$home" -a -d "$home/bak" ]; then
+				memoize -h "$domain: calculating bak size" dir_size "$home/bak"
+			else
+				echo "-"
+			fi
+			;;
+		cluster)
+			echo $CLUSTER
+			;;
+		level)
+			awk -F. '{print NF}' <<< "$domain"
+			;;
+		ns)
+			memoize -h "$domain: quering nameservers" get_domain_nss "$domain" | tr "[[:space:]]" " "
+			;;
+		ns-reg)
+			memoize -h "$domain: quering nameservers" get_domain_registrar_nss "$domain" | tr "[[:space:]]" " "
+			;;
+		ns-parent)
+			memoize -h "$domain: quering nameservers" get_domain_parent_nss "$domain" | tr "[[:space:]]" " "
+			;;
+		registrar)
+			memoize -h "$domain: quering nameservers" get_domain_registrar "$domain"
+			;;
+		subs)
+			memoize -h "$domain: quering subservers" get_subs "$domain" | tr "[[:space:]]" " "
+			;;
+		subs-count)
+			memoize -h "$domain: counting subservers" get_subs "$domain" | wc -l | trim
+			;;
+		vhost)
+			get_apache_vhost_file "$domain"
+			;;
+		engine)
+			memoize -h "$domain: quering engine" get_website_engine "$domain"
+			;;
+		users-count)
+			memoize -h "$domain: counting users" sub_user -od "$domain" list -o | wc -l | trim 
+	esac
+}
+
+help_list ()
+{
+	echo "Lists domains and associated information."
+	echo "The following columns are available for printing and filtering:"
+	echo " NAME         SHORT   DESCRIPTION"
+	echo " cluster      c       Cluster server"
+	echo " description  D       Description"	
+	echo " disabling    -       Disabling time"
+	echo " domain       d       Domain name"
+	echo " features     F       Features (DNS, mail, web etc.)"
+	echo " group        G       Group"
+	echo " home         H       Home directory"
+	echo " idn          -       International domain name"
+	echo " level        l       Domain level"	
+	echo " mail         M       Mail"
+	echo " ns           n       Nameservers"
+	echo " ns-reg       -       Nameservers (registrar records)"
+	echo " ns-parent    -       Nameservers (parent domain records)"
+	echo " owner        O       Owner user"
+	echo " parent       p       Parent domain"
+	echo " plan         P       Plan"
+	echo " registrar    r       Domain registrar"
+	echo " status       s       Status (enabled/disabled)"
+	echo " template     -       Server template"	
+	echo " type         T       Type (server/sub-server/alias)"
+	echo " vhost        -       Apache virtual host file"
+	echo
+	echo "Example:"
+	echo "# hosting list -C sM -f 'status~enabled type~server' -F l2"
+	echo
+	echo "The order of columns specified determines the order of columns to print. Special shortname '0' can be used for hide all columns currently supposed to print."
+	echo "This is useful in combination with -D key to retrieve only data from interested colums without default 'Domain' column. " 
+	echo "For example, the following command prints numbers of domains of every type:"
+	echo "# hosting list -C 0T | uniq -c"
+}
+
+usage_list ()
+{
+	echo "hosting list [-o] [-d <domains>] [-c <columns>] [-C <sort_columns>] [-f <filters>] [-F <short_filters>] [-s <status>] [-U|-u <owner>] [-P|-p <plan>] [-D <delimeter>]"
+}
+
+sub_list ()
+{
+	local status
+	local -a list_opts
+	local -a pass_opts
+	
+    # Read options
+    local OPTIND
+    local opts="${virtualmin_common_list_opts}d:s:u:p:"
+    while getopts $opts opt; do
+		case $opt in	
+			s)
+				status=$OPTARG
+				if [ $status = "disabled" ]; then
+					list_opts+=("--disabled")
+				elif [ $status = "enabled" ]; then
+					list_opts+=("--enabled")
+				else
+					error_exit "Unknown status specified: $status"
+				fi
+				;;
+			u)
+				list_opts+=("--user" "$OPTARG")
+				;;
+			p)
+				list_opts+=("--plan" "$OPTARG")
+				;;
+			d)
+				pass_opts+=("-d" "$OPTARG")
+				;;
+			*)
+				pass_opts+=("-$opt")
+				if [[ "${virtualmin_common_list_opts}" =~ $opt: ]]; then
+					pass_opts+=("$OPTARG")
+				fi
+				;;
+        esac
+    done
+    shift "$((OPTIND - 1))"
+    
+	virtualmin_common_list "list" "domains" "domain" "d" "$(quoted_args "${list_opts[@]}")" "${pass_opts[@]}" "$@"
+}
+
+# Disable subcommand
+help_disable ()
+{
+        echo "Disable domains."
+}
+
+usage_disable ()
+{
+        echo "hosting disable [-o] (-d <domains>|-a) [-r <reason>]"
+}
+
+operation_disable_domain ()
+{
+	local reason
+	
+    # Read options
+    local OPTIND
+    while getopts "r:" opt; do
+		case $opt in
+			r)
+				reason=$OPTARG
+				;;
+        esac
+    done
+    shift "$((OPTIND - 1))"
+    
+	local domain=$1
+	local status=$1
+
+	if [ $status != "disabled" ]; then
+		info "Disabling $domain on cluster '$CLUSTER'..."
+		virtualmin disable-domain --domain "$domain" ${reason:+--why "$reason"}
+	else
+		warning "Domain '$domain' already disabled on cluster '$CLUSTER'"
+	fi
+}
+
+sub_disable ()
+{
+	domains_operation -c -C "s" -e "r:" -n "disable" operation_disable_domain "$@" 
+}
+
+# Enable subcommand
+
+help_enable ()
+{
+        echo "Enable domains."
+}
+
+usage_enable ()
+{
+        echo "hosting enable [-o] (-d <domains>|-a)"
+}
+
+operation_enable_domain ()
+{
+	local domain=$1
+	local status=$1
+
+	if [ $status != "enabled" ]; then
+		info "Enabling $domain on cluster '$CLUSTER'..."
+		virtualmin enable-domain --domain "$domain"
+	else
+		warning "Domain '$domain' already enabled on cluster '$CLUSTER'"
+	fi
+}
+
+sub_enable ()
+{
+	domains_operation -c -C "s" -n "enable" operation_enable_domain "$@" 
+}
+
+# Notify subcommand
+
+help_notify ()
+{
+        echo "Send notification to domain owners."
+}
+
+usage_notify ()
+{
+        echo "hosting notify [-o] (-d <domains>|-a) [-t template] [-s subject] [-m message]"
+}
+
+operation_notify_domain ()
+{
+	local subject
+	local message
+	
+    # Read options
+    local OPTIND
+    while getopts "t:s:m:" opt; do
+		case $opt in
+			t)
+				if [ -f "$OPTARG" ]; then
+					template=$(cat "$OPTARG")
+				elif [ -f "$TMPL_DIR/$OPTARG" ]; then
+					template=$(cat "$TMPL_DIR/$OPTARG")
+				else
+					error_exit "Template $OPTARG is not found."
+				fi
+				;;
+			s)
+				subject=$OPTARG
+				;;
+			m)
+				message=$OPTARG
+				;;
+        esac
+    done
+    shift "$((OPTIND - 1))"
+    
+    local domain=$1
+    local mail=$2
+    
+    if [ -z "$template" ]; then
+    
+		if [ -z "$subject" ]; then
+			error_exit "Please specify the subject with '-s' or template with '-t'."
+		fi
+    
+		local template="$(echo -e "Subject: $subject\n\n$message")"
+    fi
+
+	local message=$(process_patterns "%domain=$domain" "%mail=$mail" <<< "$template")
+	
+	info "Sending message to $mail..."
+	$(sendmail "$mail" <<< "$message")
+}
+
+sub_notify ()
+{
+	domains_operation -e "t:s:m:" -C "M" -n "notify" operation_notify_domain "$@" 
+}
+
+# Change subcommand
+
+help_change ()
+{
+	echo "Change domains."
+}
+
+usage_change ()
+{
+	echo "hosting change [-o] (-d <domains>|-a) [-R] [-m <new-email> ] [-F <features-to-disable>] [-f <features-to-enable>] \
+		[-N <nameservers-to-remove>] [-n <nameservers-to-add>] [-C <aliases-to-remove>] [-c <aliases-to-add>] \
+		[-G <global-php-options-to-remove>] [-g <global-php-options-to-add>] 
+		[-I <php-options-to-remove>] [-i <php-options-to-add>] 
+		[-D <description>] [-p <port>] [-M <mode>] [-t <template>] [-e <execute-cmd>]"
+}
+
+operation_change_domain ()
+{
+	local recursive="no"
+	local mail_address 
+	local nss_to_remove
+	local nss_to_add
+	local aliases_to_remove
+	local aliases_to_add
+	local features_to_disable
+	local features_to_enable
+	local global_php_options_to_add
+	local global_php_options_to_remove
+	local php_options_to_add
+	local php_options_to_remove
+	local description
+	local port
+	local mode
+	local template
+	local cmd
+	
+	local -a args=("$@")
+
+    # Read options
+    local OPTIND
+    while getopts "Rm:N:n:C:c:F:f:G:g:I:i:D:p:M:t:e:" opt; do
+		case $opt in
+			R)
+				recursive="yes"
+				;;
+			m)
+				mail_address="$OPTARG"
+				;;
+			N)
+				nss_to_remove=$(get_list "$OPTARG")
+				;;
+			n)
+				nss_to_add=$(get_list "$OPTARG")
+				;;
+			C)
+				aliases_to_remove=$(get_list "$OPTARG")
+				;;
+			c)
+				aliases_to_add=$(get_list "$OPTARG")
+				;;
+			F)
+				features_to_disable=$(get_list "$OPTARG")
+				;;
+			f)
+				features_to_enable=$(get_list "$OPTARG")
+				;;
+			G)
+				global_php_options_to_remove=$(get_list "$OPTARG")
+				;;
+			g)
+				global_php_options_to_add=$(get_list "$OPTARG")
+				;;
+			I)
+				php_options_to_remove=$(get_list "$OPTARG")
+				;;
+			i)
+				php_options_to_add=$(get_list "$OPTARG")
+				;;
+			D)
+				description=$OPTARG
+				;;
+			p)
+				port=$OPTARG
+				;;
+			M)
+				mode=$OPTARG
+				;;
+			t)
+				template=$OPTARG
+				;;
+			e)
+				cmd=$OPTARG
+				;;
+        esac
+    done
+    shift "$((OPTIND - 1))"
+    
+    local domain=$1
+    local type=$2
+    local home=$3
+    local owner=$4
+    local group=$5
+    local features=$6
+    local status=$7
+	
+	local patterns=(
+		"%domain=$domain" 
+		"%type=$type" 
+		"%home=$home"
+		"%owner=$owner"
+		"%features=$features"
+		"%status=$status"
+	)
+	
+	# Contact email
+	if [ -n "$mail_address" ]; then
+		info "Set contact email to $mail_address for $domain"
+		virtualmin modify-domain --domain "$domain" --email "$mail_address"
+	fi
+
+	# Nameservers
+	local ns
+	for ns in $nss_to_remove; do
+		info "Removing '$ns' nameserver from $domain"
+		remove_domain_record "$domain" "$domain. NS $ns"
+	done
+	
+	local ns
+	for ns in $nss_to_add; do
+		info "Adding '$ns' nameserver into $domain"
+		add_domain_record "$domain" "@ NS $ns"
+	done
+
+	# Aliases
+	local als
+	for als in $aliases_to_remove; do
+		info "Removing '$als' alias from $domain"
+		remove_server_alias "$als" "$domain"
+	done
+
+	local als
+	for als in $aliases_to_add; do
+		info "Adding '$als' alias into $domain"
+		add_server_alias "$als" "$domain"
+	done
+	
+	# Features
+	local feature
+	for feature in $features_to_disable; do
+		info "Disabling '$feature' for $domain"
+		virtualmin disable-feature --domain "$domain" --$feature 
+	done
+
+	local feature
+	for feature in $features_to_enable; do
+		info "Enabling '$feature' for $domain"
+		virtualmin enable-feature --domain "$domain" --$feature 
+	done
+	
+	# PHP global options
+	local option
+	for option in $global_php_options_to_remove; do
+		info "Removing '$option' global PHP option from $domain"
+		remove_global_php_option "$option" "$domain"
+	done
+
+	local option
+	for option in $global_php_options_to_add; do
+		info "Adding '$option' global PHP option into $domain"
+		add_global_php_option "$option" "$domain"
+	done
+	
+	# PHP options
+	local option
+	for option in $php_options_to_remove; do
+		info "Removing '$option' PHP option from $domain"
+		remove_php_option "$option" "$domain"
+	done
+
+	local option
+	for option in $php_options_to_add; do
+		info "Adding '$option' PHP option into $domain"
+		add_php_option "$option" "$domain"
+	done
+	
+	# Description
+	if [ -n "$description" ]; then
+		local value=$(process_patterns "${patterns[@]}" <<< "$description")
+		info "Changing description for $domain to '$value'..."
+		virtualmin modify-domain --domain "$domain" --desc "$value" 
+	fi
+	
+	# Port
+	if [ -n "$port" ]; then
+		info "Changing port for $domain to '$port'..."
+		virtualmin modify-web --domain "$domain" --port "$port" 
+	fi
+
+	# Mode
+	if [ -n "$mode" ]; then
+		info "Changing mode for $domain to '$mode'..."
+		
+		case "$mode" in
+			cgi|fcgid)
+				virtualmin modify-web --domain "$domain" --mode "$mode" --suexec
+				convert_apache_to_cgi_settings "$domain" "$home"
+				virtualmin fix-domain-permissions --domain "$domain"
+				;;
+			mod_php)
+				virtualmin modify-web --domain "$domain" --mode "$mode" --no-suexec
+				convert_cgi_to_apache_settings "$domain" "$home"
+				virtualmin fix-domain-permissions --domain "$domain"
+				;;
+		esac
+	fi	
+	
+	# Template
+	if [ -n "$template" ]; then
+		info "Changing template for $domain to '$template'..."
+		virtualmin modify-domain --domain "$domain" --template "$template" 
+	fi	
+	
+	# Execute command
+	if [ -n "$cmd" ]; then
+		info "Executing command on '$CLUSTER' for $domain..."
+		eval "$(process_patterns "${patterns[@]}" <<< "$cmd")"
+	fi	
+	
+	if [ "$recursive" = "yes" ]; then
+		local subs=$(get_subs "$domain")
+
+		if [ -n "$subs" ]; then
+			sub_change -od "$subs" "${args[@]}"
+		fi
+	fi
+}
+
+sub_change ()
+{
+	domains_operation -c -e "Rm:N:n:C:c:F:f:G:g:I:i:D:p:M:t:e:" -C "THOGFs" -n "change" operation_change_domain "$@" 
+}
+
+# Move subcommand
+
+help_move ()
+{
+	echo "Move domains to other cluster."
+}
+
+usage_move ()
+{
+	echo "hosting move (-d <domains>|-a) -t <cluster> [-c|-D] [-B <pre-command>] [-A <post-command>]"
+}
+
+operation_move_domain ()
+{
+	local to_cluster
+	local copy_mode="delete"
+	local pre_cmd
+	local post_cmd
+	
+    # Read options
+    local OPTIND
+    while getopts "t:cDB:A:" opt; do
+		case $opt in
+			t)
+				to_cluster=$OPTARG
+				;;
+			c)
+				# Leave original copy
+				copy_mode="leave"
+				;;
+			D)
+				# Disable original copy
+				copy_mode="disable"
+				;;
+			B)
+				pre_cmd=$OPTARG
+				;;
+			A)
+				post_cmd=$OPTARG
+				;;
+        esac
+    done
+    shift "$((OPTIND - 1))"
+    
+    local domain=$1
+    local type=$2
+    local home=$3
+    local owner=$4
+    local group=$5
+    local features=$6
+    local status=$7
+
+	local patterns=(
+		"%domain=$domain" 
+		"%type=$type" 
+		"%home=$home"
+		"%owner=$owner"
+		"%features=$features"
+		"%status=$status"
+	)
+
+    if [ -z "$to_cluster" ]; then
+		error_exit "Please specify cluster to move the domain to."
+    fi
+    
+    if ! [[ "$type" =~ server ]]; then
+		error_exit "Moving servers of type '$type' is not supported."
+    fi
+    
+	if ! [ "$to_cluster" = "$CLUSTER" ]; then
+		info "Moving '$domain' from '$CLUSTER' to '$to_cluster'..."
+		
+		# Execute pre-command
+		if [ -n "$pre_cmd" ]; then
+			info "Executing pre-command on '$CLUSTER'..."
+			sub_change -od "$domain" -e "$pre_cmd" -R
+		fi
+		
+		# Backup domain
+		local tempdir=$(cluster_command -c "$to_cluster" "mktemp -d '/tmp/move-$domain.XXXXXX'")
+		
+		info "Backuping..."
+		virtualmin backup-domain --domain "$domain" --user "$owner" --all-features --except-feature dir --dest "ssh://root:-@$(get_cluster_address $to_cluster)$tempdir/$domain.tgz"
+
+		# Restore unix backup
+		info "Restoring backup..."
+# TEMP!!! ionice -c 3:
+		cluster_command -c "$to_cluster" "ionice -c 3 virtualmin restore-domain --all-domains --feature 'unix' --source '$tempdir/$domain.tgz'"
+		
+		# Transfer home directory
+		info "Transfering home directory..."
+		rsync -a --info=progress2 --delete "$home/" "$(get_cluster_address $to_cluster):$home/"
+#		cluster_command -c "$to_cluster" "chown -R $owner:$group '$home'"
+		cluster_command -c "$to_cluster" "virtualmin fix-domain-permissions --domain '$domain'"		
+
+		# Restore backup
+		info "Restoring backup..."
+# TEMP!!! ionice -c 3:
+		cluster_command -c "$to_cluster" "ionice -c 3 virtualmin restore-domain --all-domains --all-features --source '$tempdir/$domain.tgz'"
+		
+		# Remove temporary files
+		if [[ "$tempdir" =~ ^/tmp/. ]]; then
+			cluster_command -c "$to_cluster" "rm -R '$tempdir'"
+		fi
+
+		# Clear cache on the cluster
+		cluster_command -c "$to_cluster" "hosting cache -c"
+		
+		# Execute post-command
+		if [ -n "$post_cmd" ]; then
+			info "Executing post-command on '$to_cluster'..."
+			cluster_command -c "$to_cluster" "hosting change -od '$domain' -e '$post_cmd' -R"
+		fi
+		
+		# Delete/disable or leave original copy
+		case $copy_mode in
+			delete)
+				info "Deleting original copy on '$CLUSTER'..."
+				virtualmin delete-domain --domain "$domain"
+				;;
+				
+			leave)
+				info "Original copy leaved on '$CLUSTER'."
+				;;
+				
+			disable)
+				info "Disabling original copy on '$CLUSTER'..."
+				if [ "$status" = "enabled" ]; then
+					virtualmin disable-domain --domain "$domain" --why "Moved to $to_cluster"
+				fi
+				;;
+		esac
+	fi
+}
+
+sub_move ()
+{
+	domains_operation -c -e "t:cDB:A:" -C "THOGFs" -n "move" operation_move_domain "$@" 
+}
+
+# Remove subcommand
+
+help_remove ()
+{
+	echo "Remove domains."
+}
+
+usage_remove ()
+{
+	echo "hosting remove (-d <domains>|-a)  -c <cluster>"
+}
+
+operation_remove_domain ()
+{
+	local force
+	
+    # Read options
+    local OPTIND
+    while getopts "f" opt; do
+		case $opt in
+			f)
+				force="yes"
+				;;
+        esac
+    done
+    shift "$((OPTIND - 1))"
+    
+    local domain=$1
+    local status=$2
+    
+    if [ "$status" = "disabled" -o "$force" = "yes" ]; then
+    	info "Removing '$domain' from cluster '$CLUSTER'..."
+		virtualmin delete-domain --domain "$domain"
+	else
+		error "Can't remove domain '$domain' from cluster '$CLUSTER', because it's not disabled. Disable it first or use '-f' option to force removing."
+    fi
+}
+
+sub_remove ()
+{
+	domains_operation -c -e "f" -C "s" -n "remove" operation_remove_domain "$@" 
+}
+
+# Check subcommand
+
+help_check ()
+{
+        echo "Check domains for errors."
+}
+
+usage_check ()
+{
+        echo "hosting check [-o] [-d <domains>|-a] [-D] [-W]"
+}
+
+operation_check_domain ()
+{
+	local skip_dns
+	local skip_web
+	
+    # Read options
+    local OPTIND
+    while getopts "DW" opt; do
+		case $opt in
+			D)
+				skip_dns="yes"
+				;;
+			W)
+				skip_web="yes"
+				;;
+        esac
+    done
+    shift "$((OPTIND - 1))"
+    
+	local domain=$1
+	local features=$2
+	local home=$3
+	local owner=$4
+	local group=$5
+
+	info "Checking $domain..."
+	
+	if [ "$skip_dns" != "yes" ] && [[ " $features " =~ " dns " ]]; then
+		local -a dig_nss=($(get_domain_nss "$domain"))
+		local -a prt_nss=($(get_domain_parent_nss "$domain"))
+		
+		if [ "${dig_nss[*]}" != "${prt_nss[*]}" ]; then
+			local -a reg_nss=($(get_domain_registrar_nss "$domain"))
+			if [ "${dig_nss[*]}" != "${reg_nss[*]}" ]; then
+				echo "Domain NS records do not match registrar values for $domain: '${dig_nss[*]}' vs '${reg_nss[*]}'"
+			else
+				echo "Domain NS records don't match parent values for $domain (probably they're still updating): '${dig_nss[*]}' vs '${prt_nss[*]}'"
+			fi
+		else
+			local soa_record=""
+			for ns in ${dig_nss[*]}; do
+				local record=$(dig +short "@$ns" "$domain" SOA)
+				if [ "$record" != "${soa_record:-$record}" ]; then
+					echo "SOA at server '$ns' don't match SOA of other servers for $domain: '$record' vs '${soa_record}'"
+				fi
+				soa_record="$record"
+			done
+		fi
+	fi
+	
+	if [ "$skip_web" != "yes" ] && [[ " $features " =~ " web " ]]; then
+	
+		local domain_ip=$(get_host_ip "$domain")
+		local cluster_ip=$(get_cluster_ip_address)
+		local url
+				
+		if [ "$domain_ip" != "$cluster_ip" ]; then
+			local www_domain=$(get_www_domain "$domain")
+			local domain_www_ip=$(get_host_ip "$www_domain")
+			if [ -z "$domain_www_ip" ]; then
+				echo "Domain A record '$domain' is pointing to another IP address '$domain_ip' instead of '$cluster_ip' and it have no 'www' A record defined"
+			elif [ "$domain_www_ip" != "$cluster_ip" ]; then
+				echo "Domain A record '$www_domain' for $domain is pointing to another IP address: '$domain_www_ip' instead of '$cluster_ip'"
+			else	
+				url="http://www.$domain/"
+			fi
+		else
+			url="http://$domain/"
+		fi
+		
+		# Check www directory
+		local www_dir=$(get_www_dir "$domain")
+		
+		if [ -d "$www_dir" ]; then
+			local files=$(find "$www_dir" \! -user $owner)
+			if [ -n "$files" ] ; then
+				echo "Directory "$www_dir" contains $(wc -l <<< "$files") files, owned by other user. First found is '$(head -n 1 <<< "$files")'"
+			else
+				local files=$(find "$www_dir" \! -group $group)
+				if [ -n "$files" ] ; then
+					echo "Directory "$www_dir" contains $(wc -l <<< "$files") files, owned by other group. First found is '$(head -n 1 <<< "$files")'"
+				else
+					local files=$(find "$www_dir" -type f \! -perm -u+r,g+r)
+					if [ -n "$files" ] ; then
+						echo "Directory "$www_dir" contains $(wc -l <<< "$files") files with unsufficient permissions. First found is '$(head -n 1 <<< "$files")'. You can fix it manually with 'chmod -R u+r,g+r \"$www_dir\"'"
+					else
+						local files=$(find "$www_dir" -type d \! -perm -u+rx,g+rx)
+						if [ -n "$files" ] ; then
+							echo "Directory "$www_dir" contains $(wc -l <<< "$files") subdirectories with unsufficient permissions. First found is '$(head -n 1 <<< "$files")'. You can fix it manually with 'find \"$www_dir\" -type d \! -exec chmod u+rx,g+rx {} \;'"
+						else
+							local files=$(find "$www_dir" \! -type l -perm /o+rwx)
+							if [ -n "$files" ] ; then
+								echo "Directory "$www_dir" contains $(wc -l <<< "$files") files with excess permissions. First found is '$(head -n 1 <<< "$files")'. You can fix it manually with 'chmod -R o-rwx \"$www_dir\"'"
+							fi
+						fi
+					fi
+				fi
+			fi
+		fi
+		
+		# Check website availability
+		if [ "$url" ]; then
+			local http_code=$(curl --silent -o /dev/null --write-out "%{http_code}" "$url")
+			case $http_code in
+				2??|3??)
+					;;
+				000)
+					echo "Website for domain '$domain' is unavailable: connection to '$url' failed"
+					;;
+				*)
+					echo "Website for domain '$domain' is unavailable: got '$http_code' HTTP code on '$url'"
+					;;
+			esac
+		fi
+	fi
+}
+
+sub_check ()
+{
+	domains_operation -n "check" -e "DW" -C "FHOG" operation_check_domain "$@" 
+}
+
+# User subcommand
+declare -A users_available_columns=(
+	["cluster"]="Cluster"		
+	["domain"]="Domain"
+	["email"]="Email"
+	["home"]="Home"
+	["home-size"]="Home size"
+	["last"]="Last logins"
+	["mail-size"]="Mail size"
+	["maildir"]="Mail dir"
+	["password"]="Password"
+	["perm"]="Permissions"
+	["realname"]="Real name"
+	["shell"]="Shell"
+	["status"]="Status"
+	["type"]="Type"
+	["user"]="User"
+	["unix-user"]="Unix user"
+)	
+
+declare -A users_column_shortnames=(
+	["c"]="cluster"
+	["u"]="user"
+	["U"]="unix-user"
+	["d"]="domain"
+	["n"]="realname"
+	["T"]="type"
+	["H"]="home"
+	["Z"]="home-size"
+	["m"]="email"
+	["z"]="mail-size"
+	["M"]="maildir"
+	["p"]="perm"
+	["s"]="status"
+)	
+			
+declare -A users_columns_params=(
+	["domain"]="Domain"
+	["email"]="Email address"
+	["home"]="Home directory"
+	["home-size"]="Home directory"
+	["last"]="Last logins"
+	["mail-size"]="Mail location"
+	["maildir"]="Mail location"
+	["password"]="Password"
+	["perm"]="Login permissions"
+	["realname"]="Real name"
+	["status"]="Disabled"
+	["shell"]="Shell"
+	["type"]="User type"
+	["unix-user"]="Unix username"
+)
+
+users_get_column_value ()
+{
+	local domain=$1
+	local column=$2	
+	local param_value=$3
+
+	case $column in
+		home-size)
+			local home="$param_value"
+			if [ -n "$home" ]; then
+				dir_size "$home"
+			else
+				echo "-"
+			fi
+			;;
+		mail-size)
+			local maildir="$param_value"
+			if [ -n "$maildir" ]; then
+				dir_size "$maildir"
+			else
+				echo "-"
+			fi
+			;;
+		status)
+			if [ "$param_value" = "Yes" ]; then
+				echo "disabled"
+			else
+				echo "enabled"
+			fi
+			;;
+		cluster)
+			echo $CLUSTER
+			;;
+	esac
+}
+
+sub_user_list ()
+{
+	local -a list_opts
+	local -a pass_opts
+
+	local domain
+	
+    # Read options
+    local OPTIND
+    local opts="${virtualmin_common_list_opts}u:d:"
+    while getopts $opts opt; do
+		case $opt in
+			d)
+				domain=$OPTARG
+				;;
+			u)
+				pass_opts+=("-u" "$OPTARG")
+				;;
+			*)
+				pass_opts+=("-$opt")
+				if [[ "${virtualmin_common_list_opts}" =~ $opt: ]]; then
+					pass_opts+=("$OPTARG")
+				fi
+				;;
+        esac
+    done
+    shift "$((OPTIND - 1))"
+    
+    if [ -n "$domain" ]; then
+		list_opts+=("--domain" "$domain")
+    else
+    	list_opts+=("--all-domains")
+    fi
+    
+	virtualmin_common_list "user list" "users" "user" "u" "$(quoted_args "${list_opts[@]}")" "${pass_opts[@]}" "$@"
+}
+
+sub_user_add ()
+{
+	debug "USER ADD"
+}
+
+sub_user_remove ()
+{
+	debug "USER REMOVE"
+}
+
+usage_user_change ()
+{
+	echo "hosting user [-o] [-d <domains>|-a] change [-n <new-real-name>] [-p <password>] [-e <command>]"
+}
+
+operation_change_user ()
+{
+	local new_real_name
+	local password
+	local cmd
+
+    # Read options
+    local OPTIND
+    while getopts "n:p:e:" opt; do
+		case $opt in
+			n)
+				new_real_name=$OPTARG
+				;;
+			p)
+				password=$OPTARG
+				;;
+			e)
+				cmd=$OPTARG
+				;;
+        esac
+    done
+    shift "$((OPTIND - 1))"
+    
+    local user=$1
+    local unix_user=$2
+	local domain=$3
+	local home=$4
+	
+	local patterns=(
+		"%user=$user"
+		"%unix-user=$unix_user" 
+		"%domain=$domain" 
+		"%home=$home"
+	)
+    
+	if [ -n "$new_real_name" ]; then
+		local value=$(process_patterns "${patterns[@]}" <<< "$new_real_name")
+		info "Set real name to '$value' for $user@$domain"
+		
+		virtualmin modify-user --domain "$domain" --user "$user" --real "$value"
+	fi
+	
+	if [ -n "$password" ]; then
+		info "Set new password for $user@$domain"
+		
+		virtualmin modify-user --domain "$domain" --user "$user" --pass "$password"
+	fi
+	
+	# Execute command
+	if [ -n "$cmd" ]; then
+		info "Executing command on '$CLUSTER' for $user@$domain..."
+		eval "$(process_patterns "${patterns[@]}" <<< "$cmd")"
+	fi	
+}
+
+sub_user_change ()
+{
+	users_operation -c -n "user change" -e "n:p:e:" -l "d:" -C "UdH" operation_change_user "$@" 
+}
+
+help_user ()
+{
+	echo "Users."
+}
+
+usage_user ()
+{
+        echo "hosting user [-o] [-d <domains>|-a] <subcommand> [...]"
+}
+
+operation_user_subcommands ()
+{
+    # Read options
+    local OPTIND
+    while getopts "0" opt; do
+		case $opt in
+			0)
+				local null_selection="yes"
+				;;
+        esac
+    done
+    shift "$((OPTIND - 1))"
+    
+    local domain
+    if [ "$null_selection" != "yes" ]; then
+		domain=$1
+		shift
+	fi
+
+	subcommand=$1
+	shift
+	
+	run_subcommand -p "user" -c "help list add remove change" "$subcommand" ${domain:+-d "$domain"} "$@"
+}
+
+sub_user ()
+{
+	domains_operation -n "user" -N operation_user_subcommands "$@" 
+}
+
+# Usage
+usage ()
+{
+    local commands=$1
+
+    echo "usage: hosting [-c <cluster>] [-d] <command> [...]"
+    echo
+    echo "<command> is one of the following:"
+    for command in $commands; do
+		printf "  %-15s %s\n" "$command" "`help_$command`"
+    done
+    echo
+    echo "Options:"
+    printf "  %-15s %s\n" "-c <cluster>" "Run command on specified cluster."
+    printf "  %-15s %s\n" "-d" "Activate debug mode"
+}
+
+# Main part
+
+# Turn fail mode on. If subcommand exits with none-zero status, then script exits too.
+# See http://pubs.opengroup.org/onlinepubs/009695399/utilities/set.html#tag_04_127_03
+set -e
+
+CLUSTER=$(get_option 'cluster' "Cluster (hostname[:ssh-port], ex. example.org:2222)" "$(hostname)")
+CACHE_DIR=$(get_option 'cache_dir' "Cache directory" "$DEFAULT_CACHE_DIR")
+DB_DIR=$(get_option 'db_dir' "Database directory" "$DEFAULT_DB_DIR")
+TMPL_DIR=$(get_option 'templates_dir' "Templates directory" "~/templates")
+APACHE_VHOSTS_PATTERN=$(get_option 'apache_vhosts_dir' "Apache virtual hosts directory" "/etc/apache2/sites-available/*.conf")
+CACHE_TTL=$(get_option 'cache_ttl' "Cache TTL (minutes)" "120")
+TRUSTED_EXT_DNS=$(get_option 'trusted_ext_dns' "Trusted external DNS server" "8.8.8.8")
+APACHE_PHP_INI=$(get_option 'apache_php_ini' "PHP configuration file for mod_apache" "/etc/php5/apache2/php.ini")
+#IO_LOW_PRI_CMD_PREFIX=$(get_option "io_low_pric_cmd_prefix" "Command prefix for running resource-hungry programs with low i/o priority (may be empty)" "ionice -c 3")
+
+require_command "virtualmin"
+require_command "apachectl"
+require_command "gawk"
+require_command "mktemp"
+require_command "whois"
+require_command "curl"
+
+while getopts "c:" opt; do
+	case $opt in
+		c)
+			cluster=$OPTARG
+			;;
+	esac
+done
+shift "$((OPTIND - 1))"
+
+if [ -n "$cluster" ]; then
+	cluster_command -c "$cluster" "hosting $(quoted_args "$@")"
+	exit $?
+fi
+
+run_subcommand -c "help version status cache cluster list disable enable move remove notify change check user" "$@"
