@@ -2136,6 +2136,45 @@ sub_change ()
 	domains_operation -c -e "Rm:N:n:C:c:F:f:G:g:I:i:D:p:M:t:e:" -C "THOGFs" -n "change" operation_change_domain "$@" 
 }
 
+# Create subcommand
+
+help_create ()
+{
+	echo "Create domains."
+}
+
+usage_create ()
+{
+	echo "hosting create -d <domains> [-p <parent>] [-t <template>] [-F <features-to-disable>] [-f <features-to-enable>]"
+}
+
+sub_create ()
+{
+	local domains
+	local template="default"
+	
+    # Read options
+    local OPTIND
+    while getopts "d:t:" opt; do
+		case $opt in
+			d)
+				domains=$(get_list "$OPTARG")
+				;;
+			t)
+				template=$OPTARG
+				;;
+        esac
+    done
+    shift "$((OPTIND - 1))"
+    
+    # Create domains
+ 	local domain
+	for domain in $domains; do
+		info "Creating '$domain'..."
+		virtualmin create-domain --domain "$domain"
+	done
+}
+
 # Move subcommand
 
 help_move ()
@@ -2748,4 +2787,4 @@ if [ -n "$cluster" ]; then
 	exit $?
 fi
 
-run_subcommand -c "help version status cache cluster list disable enable move remove notify change check user" "$@"
+run_subcommand -c "help version status cache cluster list disable enable create move remove notify change check user" "$@"

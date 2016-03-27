@@ -1,0 +1,4 @@
+name=default
+domain_template=default
+features="web mail"
+post_cmd="date"
