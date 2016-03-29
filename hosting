@@ -1281,7 +1281,7 @@ help_version ()
 	echo "Display program version."
 }
 
-usage_help ()
+usage_version ()
 {
 	echo "hosting version"
 }
