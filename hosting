@@ -3,7 +3,7 @@
 source common.sh
 #source /usr/lib/hosting/common.sh
 
-PROGRAM_VERSION="1.0.6"
+PROGRAM_VERSION="1.0.7"
 
 CONFIG_FILE="$HOME/.hostingconfig"
 DEFAULT_CACHE_DIR="/var/cache/hosting"
@@ -12,6 +12,8 @@ if ! [ -d $DEFAULT_CACHE_DIR ]; then
 fi
 
 DEFAULT_DB_DIR="/var/db/hosting"
+
+PASSWORD_GENERATION_CMD="pwgen -N 1 10"
 
 # Common functions
 
@@ -2151,27 +2153,48 @@ usage_create ()
 sub_create ()
 {
 	local domains
+	local parent
 	local template="default"
+
 	
     # Read options
     local OPTIND
-    while getopts "d:t:" opt; do
+    while getopts "d:p:t:F:f:" opt; do
 		case $opt in
 			d)
 				domains=$(get_list "$OPTARG")
 				;;
+			p)
+				parent=$OPTARG
+				;;
 			t)
 				template=$OPTARG
+				;;
+			F)
+				features_to_disable=$(get_list "$OPTARG")
+				;;
+			f)
+				features_to_enable=$(get_list "$OPTARG")
 				;;
         esac
     done
     shift "$((OPTIND - 1))"
-    
-    # Create domains
- 	local domain
+
+	# Create domains
+	local domain
 	for domain in $domains; do
+
+		# Generate password if needed
+		local password
+		if [ -z "$parent" ]; then
+		    password=$($PASSWORD_GENERATION_CMD)
+		fi
+
 		info "Creating '$domain'..."
-		virtualmin create-domain --domain "$domain"
+		virtualmin create-domain --domain "$domain" ${password:+--pass "$password"} ${parent:+--parent "$parent"} --default-features
+
+		# Clear cache
+		clear_cache
 	done
 }
 
@@ -2772,6 +2795,7 @@ require_command "gawk"
 require_command "mktemp"
 require_command "whois"
 require_command "curl"
+require_command "pwgen"
 
 while getopts "c:" opt; do
 	case $opt in
