@@ -2157,7 +2157,7 @@ sub_create ()
 	local alias_origin
 	local alias_type="alias"
 	local mail
-	local template="default"
+	local template
 
 	
 	# Read options
