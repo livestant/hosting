@@ -2147,25 +2147,34 @@ help_create ()
 
 usage_create ()
 {
-	echo "hosting create -d <domains> [-p <parent>] [-t <template>] [-F <features-to-disable>] [-f <features-to-enable>]"
+	echo "hosting create -d <domains> [-p <parent>] [-a <alias-origin>] [-m <contact-email> ] [-t <template>] [-F <features-to-disable>] [-f <features-to-enable>]"
 }
 
 sub_create ()
 {
 	local domains
 	local parent
+	local alias_origin
+	local alias_type="alias"
+	local mail
 	local template="default"
 
 	
-    # Read options
-    local OPTIND
-    while getopts "d:p:t:F:f:" opt; do
+	# Read options
+	local OPTIND
+	while getopts "d:p:a:m:t:F:f:" opt; do
 		case $opt in
 			d)
 				domains=$(get_list "$OPTARG")
 				;;
 			p)
 				parent=$OPTARG
+				;;
+			a)
+				alias_origin=$OPTARG
+				;;
+			m)
+				mail=$OPTARG
 				;;
 			t)
 				template=$OPTARG
@@ -2176,10 +2185,14 @@ sub_create ()
 			f)
 				features_to_enable=$(get_list "$OPTARG")
 				;;
-        esac
-    done
-    shift "$((OPTIND - 1))"
-
+		esac
+	done
+	shift "$((OPTIND - 1))"
+	
+	if [ -n "$alias_origin" ] && [[ " $features_to_enable " =~ " mail " ]]; then
+		alias_type="alias-with-mail"
+	fi
+	
 	# Create domains
 	local domain
 	for domain in $domains; do
@@ -2187,11 +2200,11 @@ sub_create ()
 		# Generate password if needed
 		local password
 		if [ -z "$parent" ]; then
-		    password=$($PASSWORD_GENERATION_CMD)
+			password=$($PASSWORD_GENERATION_CMD)
 		fi
 
 		info "Creating '$domain'..."
-		virtualmin create-domain --domain "$domain" ${password:+--pass "$password"} ${parent:+--parent "$parent"} --default-features
+		virtualmin create-domain --domain "$domain" ${password:+--pass "$password"} ${parent:+--parent "$parent"}  ${alias_origin:+--$alias_type "$alias_origin"} ${mail:+--email "$mail"} ${template:+--template "$template"} --default-features
 
 		# Clear cache
 		clear_cache
