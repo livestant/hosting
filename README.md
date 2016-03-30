@@ -7,7 +7,7 @@ Though it's not required to use clusters. You just may keep this possibility in 
 
 # Installation
 
-The utility now is in early version. It's mainly works, but possibly not in any environment. Now, to install it just clone the repository with git somewhere and make symbolic links:
+The utility now is in early version. It's mainly works, but possibly not in any environment. Now, to install it just clone the repository somewhere with git and make symbolic links:
 ```
 git clone https://github.com/livestant/hosting.git
 ln -s `pwd`/hosting.git/hosting /usr/bin/hosting
