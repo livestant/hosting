@@ -14,7 +14,7 @@ ln -s `pwd`/hosting.git/hosting /usr/bin/hosting
 ln -s `pwd`/hosting.git/common.sh /usr/bin/common.sh
 ```
 
-Later normal DEB packages will be available.
+Later, normal DEB packages will be available.
 
 # Examples
 Create a new virtual server:
