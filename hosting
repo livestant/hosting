@@ -2302,7 +2302,7 @@ operation_move_domain ()
 		
 		# Transfer home directory
 		info "Transfering home directory..."
-		rsync -a --info=progress2 --delete "$home/" "$(get_cluster_address $to_cluster):$home/"
+		rsync -a --info=progress2 --delete --inplace "$home/" "$(get_cluster_address $to_cluster):$home/"
 #		cluster_command -c "$to_cluster" "chown -R $owner:$group '$home'"
 		cluster_command -c "$to_cluster" "virtualmin fix-domain-permissions --domain '$domain'"		
 
