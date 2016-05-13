@@ -10,8 +10,8 @@ Though it's not required to use clusters. You just may keep this possibility in 
 The utility now is in early version. It's mainly works, but possibly not in any environment. Now, to install it just clone the repository somewhere with git and make symbolic links:
 ```
 git clone https://github.com/livestant/hosting.git
-ln -s `pwd`/hosting.git/hosting /usr/bin/hosting
-ln -s `pwd`/hosting.git/common.sh /usr/bin/common.sh
+ln -s `pwd`/hosting/hosting /usr/bin/hosting
+ln -s `pwd`/hosting/common.sh /usr/bin/common.sh
 ```
 
 Later, normal DEB packages will be available.
